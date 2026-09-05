@@ -1,0 +1,45 @@
+# 커밋 게이트. 클론 후 최초 1회: make hooks
+# public 레포이므로 "민감 자료 유출 차단"이 린트보다 먼저다.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: detect-private-key
+      - id: mixed-line-ending
+
+  # 시크릿 스캔 — 토큰·키가 커밋에 섞이는 사고를 막는다.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      # ⚠ 실제 클라이언트 회의 자료가 public 레포로 나가는 것을 물리적으로 막는다.
+      # .gitignore 를 우회하는 `git add -f` 까지 잡기 위한 이중 방어.
+      - id: block-sensitive-paths
+        name: 민감 경로 차단 (benchmark/gold, 오디오, PLAN.md)
+        entry: bash scripts/block_sensitive.sh
+        language: system
+        pass_filenames: true
+
+      - id: mypy
+        name: mypy (strict)
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        types: [python]

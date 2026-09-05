@@ -1,0 +1,84 @@
+# ---- ⚠ 민감 자료 (public 레포 — 절대 커밋 금지) ----
+# 실제 클라이언트 회의 오디오·회의록 골든셋
+benchmark/gold/
+# 목소리 등록 DB (임베딩은 생체정보에 준한다) / 세션 오디오·전사
+data/
+sessions/
+*.wav
+*.flac
+*.m4a
+*.mp3
+# 내부 계획서 — 고객사·프로젝트 실명이 들어 있다
+PLAN.md
+FIRST-PROMPT.txt
+
+# ---- 시크릿/환경변수 ----
+.env
+.env.*
+!.env.example
+.hf_token
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets/
+*_secret*
+*_credentials*
+
+# ---- 모델 가중치·캐시 (T7 하위가 원칙, 실수 커밋 방지) ----
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+models/
+.cache/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+.venv-diart/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.ipynb_checkpoints/
+
+# ---- IDE/에디터 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ---- Claude Code 로컬 설정 ----
+.claude/settings.local.json
+.claude/.credentials*
+
+# ---- 로컬 스크래치 ----
+scratch/
+tmp/
+.tmp/
+reports/
+*.local.*
