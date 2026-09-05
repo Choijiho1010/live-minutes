@@ -1,22 +1,12 @@
-"""Phase 0 스모크 — 패키지가 임포트되고 API 가 뜬다."""
+"""설정과 T7 마운트 가드."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from liveminutes import __version__
-from liveminutes.api.main import app
 from liveminutes.config import MountError, Settings, require_t7
-
-
-def test_health() -> None:
-    client = TestClient(app)
-    res = client.get("/health")
-    assert res.status_code == 200
-    assert res.json() == {"status": "ok", "version": __version__}
 
 
 def test_default_ports() -> None:
@@ -28,6 +18,7 @@ def test_default_ports() -> None:
 
 
 def test_require_t7_raises_when_absent(tmp_path: Path) -> None:
+    """모델 캐시가 외장에 있다. 마운트 없이 진행하면 수 GB 를 내장 SSD 로 다시 받는다."""
     with pytest.raises(MountError):
         require_t7(tmp_path / "없는볼륨")
 

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>live-minutes 녹음</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+    margin: 0; padding: 28px; max-width: 560px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { opacity: .65; margin: 0 0 22px; font-size: 13px; }
+  button {
+    font: inherit; font-weight: 600; padding: 12px 22px; border-radius: 10px;
+    border: 1px solid currentColor; background: transparent; cursor: pointer;
+  }
+  button[disabled] { opacity: .4; cursor: not-allowed; }
+  #stop { border-color: #c0392b; color: #c0392b; }
+  .row { display: flex; gap: 10px; margin-bottom: 22px; }
+  #level { width: 100%; height: 10px; border-radius: 5px; background: #8883; overflow: hidden; }
+  #level > i { display: block; height: 100%; width: 0; background: #2e9e5b; transition: width .08s; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 20px 0 0; }
+  dt { opacity: .6; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  #msg { margin-top: 20px; padding: 12px 14px; border-radius: 8px; background: #8881; font-size: 13px; }
+  .warn { color: #c0392b; }
+</style>
+</head>
+<body>
+<h1>🎙 녹음 창</h1>
+<p class="sub">이 창을 닫지 마라. 마이크는 이 탭이 잡고 있다.</p>
+
+<div class="row">
+  <button id="start">녹음 시작</button>
+  <button id="stop" disabled>정지</button>
+</div>
+
+<div id="level"><i></i></div>
+
+<dl>
+  <dt>세션</dt><dd id="sid">-</dd>
+  <dt>장치 샘플레이트</dt><dd id="srate">-</dd>
+  <dt>전송</dt><dd id="sent">-</dd>
+  <dt>보낸 길이</dt><dd id="dur">0.0 초</dd>
+  <dt>버린 청크</dt><dd id="dropped">0</dd>
+</dl>
+
+<div id="msg">브라우저는 사용자가 버튼을 눌러야 마이크를 켜준다. [녹음 시작]을 눌러라.</div>
+
+<script>
+"use strict";
+
+const TARGET_RATE = 16000;
+const SEND_SAMPLES = 2048;          // 약 128ms — WS 왕복 오버헤드와 지연의 절충
+const MAX_BUFFERED = 1 << 20;       // 1MB. 넘치면 청크를 버린다(서버가 밀릴 때 무한 적재 방지)
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+
+let ctx = null, ws = null, node = null, stream = null;
+let sessionId = params.get("session_id");
+let sentBytes = 0, sentSamples = 0, dropped = 0;
+
+function say(text, warn) {
+  const el = $("msg");
+  el.textContent = text;
+  el.className = warn ? "warn" : "";
+}
+
+/**
+ * AudioWorklet 본체. 두 가지 함정을 여기서 처리한다.
+ *  1) 샘플레이트를 48000 으로 가정하지 않는다 — 실제 값(sampleRate)으로 비율을 구한다.
+ *  2) 그냥 N 칸마다 하나씩 뽑으면 8kHz 위의 소리가 접혀 들어와(에일리어싱) 한국어
+ *     자음이 뭉개진다. 창 씌운 sinc 저역통과를 통과시킨 뒤 뽑는다. 계수는 위상별로
+ *     미리 만들어 두고(폴리페이즈) 출력 시점의 소수 위상으로 골라 쓴다.
+ * ratio 가 1 이면(컨텍스트가 이미 16kHz) 필터 없이 그대로 넘긴다.
+ */
+const WORKLET_SRC = `
+const PHASES = 64;          // 위상 양자화. 16kHz 기준 위상오차 < 1/64 샘플
+const CUTOFF = 0.45;        // 출력 나이퀴스트의 90% 지점에서 자른다
+
+function buildKernels(ratio, taps) {
+  // 입력 샘플레이트 기준 정규화 컷오프. 3배 다운샘플이면 0.15.
+  const fc = CUTOFF / ratio;
+  const center = (taps - 1) / 2;
+  const table = [];
+  for (let p = 0; p < PHASES; p++) {
+    const phase = p / PHASES;
+    const h = new Float32Array(taps);
+    let sum = 0;
+    for (let k = 0; k < taps; k++) {
+      const t = k - center + phase;
+      const x = 2 * fc * t;
+      const sinc = Math.abs(x) < 1e-8 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
+      // Hann 창 — 사이드로브를 눌러 저지대역 누설을 막는다
+      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * (k + phase)) / (taps - 1 + 1));
+      h[k] = sinc * w;
+      sum += h[k];
+    }
+    for (let k = 0; k < taps; k++) h[k] /= sum;   // DC 이득 1 로 정규화
+    table.push(h);
+  }
+  return table;
+}
+
+class Downsampler extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this.target = opts.processorOptions.targetRate;
+    this.ratio = sampleRate / this.target;
+    this.taps = Math.max(17, 2 * Math.round(4 * this.ratio) + 1);  // 홀수. 짧으면 전이대역이 넓어 8kHz 바로 위가 덜 죽는다
+    this.kernels = this.ratio === 1 ? null : buildKernels(this.ratio, this.taps);
+    this.hist = new Float32Array(this.taps);   // 지연선. hist[0] 이 가장 최근
+    this.pos = 0;                              // 다음 출력까지 남은 입력 거리
+    this.out = new Float32Array(${SEND_SAMPLES});
+    this.outLen = 0;
+    this.peak = 0;
+  }
+
+  push(v) {
+    this.out[this.outLen++] = v;
+    if (this.outLen === this.out.length) {
+      this.port.postMessage({ pcm: this.out.slice(0), peak: this.peak }, []);
+      this.outLen = 0;
+      this.peak = 0;
+    }
+  }
+
+  filtered(phase) {
+    const h = this.kernels[(phase * PHASES) | 0];
+    let acc = 0;
+    for (let k = 0; k < this.taps; k++) acc += h[k] * this.hist[k];
+    return acc;
+  }
+
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const raw = ch[i];
+      const a = raw < 0 ? -raw : raw;
+      if (a > this.peak) this.peak = a;
+
+      if (this.ratio === 1) { this.push(raw); continue; }
+
+      this.hist.copyWithin(1, 0);      // 지연선을 한 칸 밀고
+      this.hist[0] = raw;              // 최신 샘플을 앞에 넣는다
+      // 이 입력 구간 안에 출력 격자가 들어오면 그 소수 위상으로 필터를 적용한다.
+      while (this.pos < 1) {
+        this.push(this.filtered(this.pos));
+        this.pos += this.ratio;
+      }
+      this.pos -= 1;
+    }
+    return true;
+  }
+}
+registerProcessor("downsampler", Downsampler);
+`;
+
+function toPCM16(float32) {
+  const buf = new ArrayBuffer(float32.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < float32.length; i++) {
+    let s = float32[i];
+    s = s < -1 ? -1 : s > 1 ? 1 : s;
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buf;
+}
+
+async function ensureSession() {
+  if (sessionId) return sessionId;
+  const res = await fetch("/sessions", { method: "POST" });
+  if (!res.ok) throw new Error("세션 생성 실패: HTTP " + res.status);
+  sessionId = (await res.json()).id;
+  return sessionId;
+}
+
+async function start() {
+  $("start").disabled = true;
+  try {
+    await ensureSession();
+    $("sid").textContent = sessionId;
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+
+    // 1차: 컨텍스트에 16kHz 를 요구한다. 받아주면 브라우저가 고품질로 리샘플해 준다.
+    try { ctx = new AudioContext({ sampleRate: TARGET_RATE }); }
+    catch (_) { ctx = new AudioContext(); }
+    await ctx.resume();
+    // 2차: 요구가 무시됐으면(실제 값이 다르면) 워크릿이 직접 내린다.
+    $("srate").textContent =
+      ctx.sampleRate + " Hz" + (ctx.sampleRate === TARGET_RATE ? "" : " → 16000 Hz 변환");
+
+    const blob = new Blob([WORKLET_SRC], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws/capture?session_id=${sessionId}`);
+    ws.binaryType = "arraybuffer";
+
+    await new Promise((ok, fail) => {
+      ws.onopen = ok;
+      ws.onerror = () => fail(new Error("WebSocket 연결 실패"));
+    });
+    ws.send(JSON.stringify({
+      type: "hello",
+      deviceSampleRate: ctx.sampleRate,
+      targetSampleRate: TARGET_RATE,
+    }));
+    ws.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.type === "stats" && typeof m.server_dropped === "number" && m.server_dropped > 0) {
+          say(`서버가 밀려 청크 ${m.server_dropped}개를 버렸다.`, true);
+        }
+      } catch (_) { /* 무시 */ }
+    };
+    ws.onclose = () => { if (node) stop("연결이 끊겼다."); };
+
+    node = new AudioWorkletNode(ctx, "downsampler", {
+      numberOfInputs: 1,
+      numberOfOutputs: 0,
+      processorOptions: { targetRate: TARGET_RATE },
+    });
+    node.port.onmessage = (ev) => {
+      const { pcm, peak } = ev.data;
+      $("level").firstElementChild.style.width = Math.min(100, peak * 140) + "%";
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (ws.bufferedAmount > MAX_BUFFERED) {     // 서버가 밀리면 쌓지 않고 버린다
+        dropped++;
+        $("dropped").textContent = dropped;
+        say(`전송이 밀려 청크 ${dropped}개를 버렸다.`, true);
+        return;
+      }
+      const buf = toPCM16(pcm);
+      ws.send(buf);
+      sentBytes += buf.byteLength;
+      sentSamples += pcm.length;
+      $("sent").textContent = (sentBytes / 1024).toFixed(0) + " KB";
+      $("dur").textContent = (sentSamples / TARGET_RATE).toFixed(1) + " 초";
+    };
+
+    ctx.createMediaStreamSource(stream).connect(node);
+    $("stop").disabled = false;
+    say("녹음 중. 말해라.");
+  } catch (err) {
+    $("start").disabled = false;
+    say(String(err && err.message ? err.message : err), true);
+  }
+}
+
+function stop(reason) {
+  if (node) { node.port.onmessage = null; node.disconnect(); node = null; }
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.onclose = null; ws.close(1000, "stopped"); }
+  ws = null;
+  if (ctx) { ctx.close(); ctx = null; }
+  $("start").disabled = false;
+  $("stop").disabled = true;
+  $("level").firstElementChild.style.width = "0";
+  say(reason || "정지했다. 세션은 열려 있다 — 다시 시작할 수 있다.");
+}
+
+$("start").onclick = start;
+$("stop").onclick = () => stop();
+window.addEventListener("beforeunload", () => stop());
+if (sessionId) $("sid").textContent = sessionId;
+</script>
+</body>
+</html>

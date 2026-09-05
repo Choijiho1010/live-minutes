@@ -34,8 +34,8 @@ diar = [
     "torch>=2.4",
     "torchaudio>=2.4",
 ]
-# 데모 UI (결재 2)
-ui = ["streamlit>=1.38"]
+# 데모 UI (결재 2). httpx 로 API 를 폴링한다 — dev 그룹 없이도 떠야 한다.
+ui = ["streamlit>=1.38", "httpx>=0.27"]
 # 회의록 생성 — LangGraph 6단계 (결재 4)
 minutes = ["langgraph>=1.0", "langchain>=1.0"]
 

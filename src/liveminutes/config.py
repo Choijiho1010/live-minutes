@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     t7_root: Path = Path("/Volumes/T7")
     data_dir: Path = Path("/Volumes/T7/live-minutes/data")
 
+    # 마지막 세션 오디오를 가리키는 심볼릭 링크. 재생 확인을 늘 같은 경로에서 한다.
+    debug_wav: Path = Path("var/debug.wav")
+
 
 settings = Settings()
 
